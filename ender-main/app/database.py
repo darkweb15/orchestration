@@ -13,11 +13,34 @@ logger = logging.getLogger(__name__)
 
 _client: Client | None = None
 _client_lock = Lock()
+_missing_config_logged = False
+
+
+def lead_identity_key(place_id: str = "", name: str = "", address: str = "") -> str:
+    """Build a stable identity key for a lead when we have enough data to trust it."""
+    if place_id:
+        return f"place_id:{place_id.strip()}"
+
+    normalized_name = name.strip().casefold()
+    normalized_address = address.strip().casefold()
+    if normalized_name and normalized_address:
+        return f"name_address:{normalized_name}|{normalized_address}"
+
+    return ""
+
+
+def get_connection_status() -> dict[str, bool]:
+    """Return whether Supabase is configured and whether a client is available."""
+    key = os.environ.get("SUPABASE_SERVICE_ROLE_KEY", "") or os.environ.get("SUPABASE_KEY", "")
+    configured = bool(os.environ.get("SUPABASE_URL", "") and key)
+    connected = bool(get_client()) if configured else False
+    return {"configured": configured, "connected": connected}
 
 
 def get_client() -> Client | None:
     """Get or create a Supabase client."""
     global _client
+    global _missing_config_logged
     if _client is not None:
         return _client
     
@@ -26,14 +49,20 @@ def get_client() -> Client | None:
             return _client
             
         url = os.environ.get("SUPABASE_URL", "")
-        key = os.environ.get("SUPABASE_KEY", "")
+        key = os.environ.get("SUPABASE_SERVICE_ROLE_KEY", "") or os.environ.get("SUPABASE_KEY", "")
 
         if not url or not key:
-            logger.warning("SUPABASE_URL or SUPABASE_KEY not set. Database disabled.")
+            if not _missing_config_logged:
+                logger.warning(
+                    "SUPABASE_URL and a Supabase key (prefer SUPABASE_SERVICE_ROLE_KEY) are required. "
+                    "Database disabled."
+                )
+                _missing_config_logged = True
             return None
 
         try:
             _client = create_client(url, key)
+            _missing_config_logged = False
             logger.info("Supabase client connected.")
             return _client
         except Exception as e:
@@ -165,10 +194,20 @@ async def save_lead(lead: LeadResult, task_id: str) -> bool:
             "date": lead.date,
         }
 
-        # Use upsert to handle duplicates gracefully (name+address unique constraint)
-        client.table("business_data").upsert(
-            data, on_conflict="name,address"
-        ).execute()
+        if lead.place_id:
+            existing = client.table("business_data").select("id").eq("place_id", lead.place_id).limit(1).execute()
+            if existing.data:
+                client.table("business_data").update(data).eq("id", existing.data[0]["id"]).execute()
+                return True
+
+        if lead.name and lead.address:
+            # Use upsert for the stable fallback identity available in the current schema.
+            client.table("business_data").upsert(
+                data, on_conflict="name,address"
+            ).execute()
+            return True
+
+        client.table("business_data").insert(data).execute()
         return True
     except Exception as e:
         logger.error(f"Failed to save lead {lead.name}: {e}")
@@ -186,19 +225,22 @@ async def save_leads_batch(leads: list[LeadResult], task_id: str) -> int:
     return saved
 
 
-async def is_duplicate(name: str, address: str) -> bool:
+async def is_duplicate(name: str, address: str, place_id: str = "") -> bool:
     """Check if a business already exists in the database."""
     client = get_client()
     if not client:
         return False
 
-    if not name:
+    identity_key = lead_identity_key(place_id=place_id, name=name, address=address)
+    if not identity_key:
         return False
 
     try:
-        query = client.table("business_data").select("id").eq("name", name)
-        if address:
-            query = query.eq("address", address)
+        if place_id:
+            result = client.table("business_data").select("id").eq("place_id", place_id).limit(1).execute()
+            return len(result.data) > 0
+
+        query = client.table("business_data").select("id").eq("name", name).eq("address", address)
         result = query.limit(1).execute()
         return len(result.data) > 0
     except Exception as e:

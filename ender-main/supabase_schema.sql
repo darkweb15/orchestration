@@ -57,21 +57,28 @@ CREATE TABLE IF NOT EXISTS business_data (
     state TEXT DEFAULT '',
     country TEXT DEFAULT '',
     date TEXT DEFAULT '',
-    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
-    UNIQUE(name, address)
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
 );
 
 -- 3. Indexes for fast lookups
 CREATE INDEX IF NOT EXISTS idx_business_task_id ON business_data(task_id);
-CREATE INDEX IF NOT EXISTS idx_business_name_address ON business_data(name, address);
 CREATE INDEX IF NOT EXISTS idx_business_industry ON business_data(search_query);
 CREATE INDEX IF NOT EXISTS idx_tasks_status ON scraping_tasks(status);
 CREATE INDEX IF NOT EXISTS idx_tasks_created ON scraping_tasks(created_at DESC);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_business_place_id_unique
+    ON business_data(place_id)
+    WHERE place_id <> '';
+CREATE UNIQUE INDEX IF NOT EXISTS idx_business_name_address_unique
+    ON business_data(name, address)
+    WHERE address <> '';
 
--- 4. Enable Row Level Security (optional but recommended)
+-- Existing deployments that already created a broad UNIQUE(name, address) constraint
+-- should drop that constraint before applying the partial unique indexes above.
+
+-- 4. Enable Row Level Security (recommended)
 ALTER TABLE scraping_tasks ENABLE ROW LEVEL SECURITY;
 ALTER TABLE business_data ENABLE ROW LEVEL SECURITY;
 
--- 5. Create policies to allow all operations (since this is a private app)
-CREATE POLICY "Allow all on scraping_tasks" ON scraping_tasks FOR ALL USING (true) WITH CHECK (true);
-CREATE POLICY "Allow all on business_data" ON business_data FOR ALL USING (true) WITH CHECK (true);
+-- 5. Production recommendation:
+-- Use SUPABASE_SERVICE_ROLE_KEY on the backend and do NOT create blanket allow-all policies.
+-- If you need direct client access later, add narrowly scoped policies for those exact use cases.

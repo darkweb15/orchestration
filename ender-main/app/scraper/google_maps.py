@@ -1,7 +1,6 @@
 """Google Maps scraper using Playwright — rebuilt with proven techniques."""
 
 import asyncio
-import json
 import re
 import logging
 from datetime import datetime
@@ -9,7 +8,7 @@ from urllib.parse import quote_plus
 
 from playwright.async_api import async_playwright, Page
 
-from app.config import SCROLL_PAUSE_TIME, MAX_SCROLLS, GOOGLE_MAPS_INITIAL_WAIT, PLACE_PAGE_WAIT, SCROLL_WAIT, CONTENT_LOAD_WAIT, get_wait_times
+from app.config import SCROLL_PAUSE_TIME, MAX_SCROLLS, get_wait_times
 from app.models import LeadResult
 
 logger = logging.getLogger(__name__)

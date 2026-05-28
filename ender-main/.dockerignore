@@ -1,17 +1,30 @@
+# Git
+.git
+.gitignore
+
+# Python
+__pycache__
+*.py[cod]
+*.egg-info
+.pytest_cache
+.coverage
+
+# Virtual environments
 venv/
 .venv/
-__pycache__/
-*.py[cod]
-.git/
-.gitignore
+
+# Dev & secrets
 .env
-output/
-*.csv
-*.json
-!package.json
-.vscode/
-.idea/
 *.log
+*.md
+
+# Tests (not needed in production image)
+tests/
+
+# OS
 .DS_Store
 Thumbs.db
-.agents/
+*Zone.Identifier
+
+# Output
+output/

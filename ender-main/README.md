@@ -6,7 +6,7 @@ Built with **FastAPI** (backend) and a modern **HTML/CSS/JS** frontend with a da
 
 ## Features
 
-- **Google Maps Scraping** — Search by category + zip code to find businesses
+- **Google Maps Scraping** — Search by category + US ZIP target to find businesses
 - **Deep Email Extraction** — Extracts emails from:
   - Google Maps listing
   - Business website (homepage + contact/about pages)
@@ -84,8 +84,8 @@ Open [http://localhost:8000](http://localhost:8000) in your browser.
 ## Usage
 
 1. **Enter Search Terms** — One per line (e.g., `liquor stores`, `wine shops`)
-2. **Enter Zip Codes** — One per line in format: `zipcode city state country`
-   - Example: `10001 New York NY USA`
+2. **Enter US ZIP Targets** — One per line in format: `zipcode city state [USA]`
+   - Examples: `10001 New York NY`, `10001 New York NY USA`
 3. **Set Max Results** — Maximum results per search combination
 4. **Click "Start Scraping"** — Watch real-time progress
 5. **Export Results** — Download as CSV or JSON

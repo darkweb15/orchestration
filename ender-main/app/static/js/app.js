@@ -6,6 +6,7 @@ let currentJobId = null;
 let pollInterval = null;
 let allResults = [];
 let dbData = [];
+let authToastVisible = false;
 
 // ═══════════════════════════════════════════════════════════════
 // API KEY HELPER
@@ -38,6 +39,44 @@ function loadSavedApiKey() {
     const saved = localStorage.getItem('scrapepro_api_key');
     const input = document.getElementById('apiKeyInput');
     if (saved && input) input.value = saved;
+}
+
+function notifyAuthRequired() {
+    if (authToastVisible) return;
+    authToastVisible = true;
+    showToast('API key required or invalid. Update it in Settings.', 'error');
+    setTimeout(() => { authToastVisible = false; }, 4000);
+}
+
+async function apiFetch(url, options = {}) {
+    const mergedHeaders = { ...getApiHeaders(), ...(options.headers || {}) };
+    const response = await fetch(url, { ...options, headers: mergedHeaders });
+    if (response.status === 403) notifyAuthRequired();
+    return response;
+}
+
+async function apiFetchJson(url, options = {}, fallbackMessage = 'Request failed') {
+    const response = await apiFetch(url, options);
+    const data = await response.json().catch(() => ({}));
+    if (!response.ok) {
+        throw new Error(data.detail || data.error || fallbackMessage);
+    }
+    return data;
+}
+
+async function apiDownload(url, filename) {
+    const response = await apiFetch(url);
+    if (!response.ok) {
+        let message = 'Export failed';
+        try {
+            const data = await response.json();
+            message = data.detail || data.error || message;
+        } catch (e) {
+            // Keep the fallback message when the response body is not JSON.
+        }
+        throw new Error(message);
+    }
+    await downloadBlob(response, filename);
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -151,18 +190,29 @@ async function checkSupabaseStatus() {
     const statusEl = document.getElementById('supabaseStatus');
     const indicator = document.getElementById('supabaseIndicator');
     try {
-        const response = await fetch('/api/stats');
-        if (response.ok) {
+        const data = await apiFetchJson('/api/health', {}, 'Health check failed');
+        const dot = indicator ? indicator.querySelector('.status-dot') : null;
+        if (!data.database.configured) {
+            statusEl.textContent = 'Disabled: configure SUPABASE_URL and SUPABASE_KEY';
+            statusEl.style.color = '#f59e0b';
+            if (dot) dot.classList.remove('connected');
+            return;
+        }
+
+        if (data.database.connected) {
             statusEl.textContent = 'Connected and operational';
             statusEl.style.color = '#10b981';
-            if (indicator) indicator.querySelector('.status-dot').classList.add('connected');
+            if (dot) dot.classList.add('connected');
         } else {
-            statusEl.textContent = 'Connection error';
+            statusEl.textContent = 'Configured but unavailable';
             statusEl.style.color = '#ef4444';
+            if (dot) dot.classList.remove('connected');
         }
     } catch (e) {
         statusEl.textContent = 'Disconnected';
         statusEl.style.color = '#ef4444';
+        const dot = indicator ? indicator.querySelector('.status-dot') : null;
+        if (dot) dot.classList.remove('connected');
     }
 }
 
@@ -242,8 +292,7 @@ function showToast(message, type = 'info') {
 
 async function loadDbStats() {
     try {
-        const response = await fetch('/api/stats');
-        const data = await response.json();
+        const data = await apiFetchJson('/api/stats', {}, 'Failed to load database stats');
 
         const totalBiz = data.total_businesses || 0;
         const totalEmails = data.total_emails || 0;
@@ -260,8 +309,7 @@ async function loadDbStats() {
 
         // Load POS count from data endpoint
         try {
-            const dataResp = await fetch('/api/data?limit=5000');
-            const dataResult = await dataResp.json();
+            const dataResult = await apiFetchJson('/api/data?limit=5000', {}, 'Failed to load database records');
             const allData = dataResult.data || [];
             const posCount = allData.filter(r => r.has_pos === 'Yes').length;
             animateNumber('dbTotalPos', posCount);
@@ -275,8 +323,7 @@ async function loadDbStats() {
 
         // Industries
         try {
-            const indResp = await fetch('/api/industries');
-            const indData = await indResp.json();
+            const indData = await apiFetchJson('/api/industries', {}, 'Failed to load industries');
             const indCount = (indData.industries || []).length;
             document.getElementById('industryCount').textContent = indCount;
             document.getElementById('industryBar').style.width = Math.min(indCount * 10, 100) + '%';
@@ -314,8 +361,7 @@ async function loadRecentTasks() {
     const emptyEl = document.getElementById('dashboardEmpty');
     const tableEl = document.getElementById('recentRunsTable');
     try {
-        const response = await fetch('/api/tasks');
-        const data = await response.json();
+        const data = await apiFetchJson('/api/tasks', {}, 'Failed to load recent tasks');
         const tasks = (data.tasks || []).slice(0, 8);
 
         if (tasks.length === 0) {
@@ -328,11 +374,11 @@ async function loadRecentTasks() {
         if (tableEl) tableEl.style.display = 'block';
 
         container.innerHTML = tasks.map(t => {
-            const statusClass = t.status === 'Completed' ? 'cell-open' :
-                               t.status === 'Running' ? 'accent-blue' : 'cell-closed';
             const created = t.created_at ? new Date(t.created_at).toLocaleDateString() : '-';
             const statusBadge = t.status === 'Completed' ?
                 '<span style="color:var(--success);font-weight:600;">Completed</span>' :
+                t.status === 'Completed with Errors' ?
+                '<span style="color:var(--warning);font-weight:600;">Warnings</span>' :
                 t.status === 'Running' ?
                 '<span style="color:var(--blue);font-weight:600;">Running</span>' :
                 '<span style="color:var(--danger);font-weight:600;">Failed</span>';
@@ -378,19 +424,16 @@ async function startScraping() {
     addLogEntry('info', `Starting scrape: ${searchTerms.join(', ')} in ${zipCodes.length} locations (${scrapingSpeed} mode)`);
 
     try {
-        const response = await fetch('/api/scrape', {
+        const data = await apiFetchJson('/api/scrape', {
             method: 'POST',
             headers: getApiHeaders('application/json'),
-            body: JSON.stringify({ 
-                search_terms: searchTerms, 
-                zip_codes: zipCodes, 
+            body: JSON.stringify({
+                search_terms: searchTerms,
+                zip_codes: zipCodes,
                 max_results_per_search: maxResults,
                 scraping_speed: scrapingSpeed
             }),
-        });
-
-        const data = await response.json();
-        if (!response.ok) throw new Error(data.error || 'Failed to start scraping');
+        }, 'Failed to start scraping');
 
         currentJobId = data.job_id;
         showToast('Scraping started!', 'success');
@@ -417,7 +460,7 @@ function startPolling() {
         if (!currentJobId) return;
 
         try {
-            const response = await fetch(`/api/job/${currentJobId}`);
+            const response = await apiFetch(`/api/job/${currentJobId}`);
             if (response.status === 404) {
                 // Job not found in memory - check database
                 clearInterval(pollInterval);
@@ -425,8 +468,14 @@ function startPolling() {
                 await checkJobInDatabase(currentJobId);
                 return;
             }
-            const data = await response.json();
-            if (!response.ok) throw new Error(data.error);
+            if (response.status === 403) {
+                clearInterval(pollInterval);
+                pollInterval = null;
+                resetScraper();
+                return;
+            }
+            const data = await response.json().catch(() => ({}));
+            if (!response.ok) throw new Error(data.detail || data.error || 'Failed to poll job status');
 
             const percent = data.total > 0 ? Math.round((data.completed / data.total) * 100) : 0;
             document.getElementById('progressBar').style.width = `${percent}%`;
@@ -459,7 +508,7 @@ function startPolling() {
                 successEl.textContent = percent + '%';
             }
 
-            if (data.status === 'completed' || data.status === 'failed') {
+            if (data.status === 'completed' || data.status === 'completed_with_errors' || data.status === 'failed') {
                 clearInterval(pollInterval);
                 pollInterval = null;
 
@@ -477,9 +526,17 @@ function startPolling() {
                     showToast(doneMsg, 'success');
                     addLogEntry('info', `Job completed: ${data.results_count} leads found, ${data.duplicates_skipped || 0} duplicates skipped`);
                     if (badge) { badge.className = 'monitor-badge idle'; badge.textContent = 'Done'; }
+                } else if (data.status === 'completed_with_errors') {
+                    const doneMsg = `Completed with warnings: ${data.results_count} leads, ${(data.errors || []).length} issue(s).`;
+                    showToast(doneMsg, 'info');
+                    addLogEntry('warn', `Job completed with warnings: ${(data.errors || []).join(' | ') || 'Unknown issue'}`);
+                    if (badge) { badge.className = 'monitor-badge idle'; badge.textContent = 'Warnings'; }
                 } else {
-                    showToast('Scraping failed. Check logs.', 'error');
-                    addLogEntry('error', 'Job failed');
+                    const failedMsg = data.results_count > 0
+                        ? `Job failed after collecting ${data.results_count} leads. Check logs.`
+                        : 'Scraping failed. Check logs.';
+                    showToast(failedMsg, 'error');
+                    addLogEntry('error', `Job failed: ${(data.errors || []).join(' | ') || 'Unknown error'}`);
                     if (badge) { badge.className = 'monitor-badge idle'; badge.textContent = 'Failed'; }
                 }
 
@@ -499,36 +556,29 @@ function startPolling() {
 
 async function checkJobInDatabase(jobId) {
     try {
-        const response = await fetch(`/api/tasks/${jobId}/results`);
-        if (response.ok) {
-            const data = await response.json();
-            const results = data.results || [];
-            
-            // Job completed and saved to database
-            allResults = results;
-            updateLiveStats();
-            renderResults(allResults);
-            
-            const startBtn = document.getElementById('startBtn');
-            startBtn.disabled = false;
-            startBtn.innerHTML = '<i class="fas fa-play"></i> Run Scraper';
-            document.getElementById('progressContainer').style.display = 'none';
-            document.getElementById('liveIndicator').style.display = 'none';
-            
-            const badge = document.querySelector('.monitor-badge');
-            if (badge) { badge.className = 'monitor-badge idle'; badge.textContent = 'Done'; }
-            
-            showToast(`Job completed! Found ${results.length} leads.`, 'success');
-            addLogEntry('info', `Job ${jobId} completed with ${results.length} results`);
-            loadDbStats();
-        } else {
-            // Job not found anywhere
-            showToast('Job not found. It may have been deleted.', 'error');
-            resetScraper();
-        }
+        const data = await apiFetchJson(`/api/tasks/${jobId}/results`, {}, 'Job lookup failed');
+        const results = data.results || [];
+
+        // Job completed and saved to database
+        allResults = results;
+        updateLiveStats();
+        renderResults(allResults);
+
+        const startBtn = document.getElementById('startBtn');
+        startBtn.disabled = false;
+        startBtn.innerHTML = '<i class="fas fa-play"></i> Run Scraper';
+        document.getElementById('progressContainer').style.display = 'none';
+        document.getElementById('liveIndicator').style.display = 'none';
+
+        const badge = document.querySelector('.monitor-badge');
+        if (badge) { badge.className = 'monitor-badge idle'; badge.textContent = 'Done'; }
+
+        showToast(`Job completed! Found ${results.length} leads.`, 'success');
+        addLogEntry('info', `Job ${jobId} completed with ${results.length} results`);
+        loadDbStats();
     } catch (error) {
         console.error('Failed to check job in database:', error);
-        showToast('Job status unknown. Check task history.', 'error');
+        showToast(error.message || 'Job status unknown. Check task history.', 'error');
         resetScraper();
     }
 }
@@ -615,8 +665,7 @@ async function loadTaskHistory() {
     const wrapper = document.getElementById('tasksTableWrapper');
 
     try {
-        const response = await fetch('/api/tasks');
-        const data = await response.json();
+        const data = await apiFetchJson('/api/tasks', {}, 'Failed to load task history');
         const tasks = data.tasks || [];
 
         if (tasks.length === 0) {
@@ -631,6 +680,7 @@ async function loadTaskHistory() {
         tasksBody.innerHTML = tasks.map(t => {
             const created = t.created_at ? new Date(t.created_at).toLocaleString() : '-';
             const statusClass = t.status === 'Completed' ? 'cell-open' :
+                               t.status === 'Completed with Errors' ? 'accent-orange' :
                                t.status === 'Failed' ? 'cell-closed' : '';
             return `<tr>
                 <td><code style="color:var(--primary-light);font-size:0.75rem;">${escapeHtml(t.job_id)}</code></td>
@@ -665,8 +715,7 @@ async function loadTaskHistory() {
 
 async function viewTaskResults(jobId) {
     try {
-        const response = await fetch(`/api/tasks/${jobId}/results`);
-        const data = await response.json();
+        const data = await apiFetchJson(`/api/tasks/${jobId}/results`, {}, 'Failed to load task results');
         const results = data.results || [];
 
         if (results.length === 0) {
@@ -685,9 +734,7 @@ async function viewTaskResults(jobId) {
 
 async function downloadTaskExport(jobId, format) {
     try {
-        const response = await fetch(`/api/export-task/${jobId}/${format}`);
-        if (!response.ok) throw new Error('Export failed');
-        downloadBlob(response, `task_${jobId}.${format}`);
+        await apiDownload(`/api/export-task/${jobId}/${format}`, `task_${jobId}.${format}`);
         showToast(`Task ${jobId} exported as ${format.toUpperCase()}`, 'success');
     } catch (error) {
         showToast(error.message, 'error');
@@ -699,16 +746,11 @@ async function deleteTask(jobId) {
     if (!confirmed) return;
 
     try {
-        const response = await fetch(`/api/tasks/${jobId}`, { method: 'DELETE', headers: getApiHeaders() });
-        const data = await response.json();
-        if (response.ok) {
-            showToast('Task deleted.', 'success');
-            addLogEntry('warn', `Task ${jobId} deleted`);
-            loadTaskHistory();
-            loadDbStats();
-        } else {
-            throw new Error(data.error || 'Delete failed');
-        }
+        await apiFetchJson(`/api/tasks/${jobId}`, { method: 'DELETE' }, 'Delete failed');
+        showToast('Task deleted.', 'success');
+        addLogEntry('warn', `Task ${jobId} deleted`);
+        loadTaskHistory();
+        loadDbStats();
     } catch (error) {
         showToast(error.message, 'error');
     }
@@ -721,15 +763,11 @@ async function deleteAllData() {
     if (!confirmed2) return;
 
     try {
-        const response = await fetch('/api/data', { method: 'DELETE', headers: getApiHeaders() });
-        if (response.ok) {
-            showToast('All data deleted.', 'success');
-            addLogEntry('warn', 'All data deleted by user');
-            loadTaskHistory();
-            loadDbStats();
-        } else {
-            throw new Error('Delete failed');
-        }
+        await apiFetchJson('/api/data', { method: 'DELETE' }, 'Delete failed');
+        showToast('All data deleted.', 'success');
+        addLogEntry('warn', 'All data deleted by user');
+        loadTaskHistory();
+        loadDbStats();
     } catch (error) {
         showToast(error.message, 'error');
     }
@@ -741,8 +779,7 @@ async function deleteAllData() {
 
 async function loadIndustries() {
     try {
-        const response = await fetch('/api/industries');
-        const data = await response.json();
+        const data = await apiFetchJson('/api/industries', {}, 'Failed to load industries');
         const industries = data.industries || [];
 
         const select = document.getElementById('industryFilter');
@@ -765,8 +802,7 @@ async function loadDatabaseData() {
     const dbTableContainer = document.getElementById('dbTableContainer');
 
     try {
-        const response = await fetch(`/api/data?industry=${encodeURIComponent(industry)}`);
-        const data = await response.json();
+        const data = await apiFetchJson(`/api/data?industry=${encodeURIComponent(industry)}`, {}, 'Failed to load database data');
         dbData = data.data || [];
 
         document.getElementById('dbResultCount').textContent = `${dbData.length} records`;
@@ -851,9 +887,7 @@ async function exportResults(format) {
     }
 
     try {
-        const response = await fetch(`/api/export/${currentJobId}/${format}`);
-        if (!response.ok) throw new Error('Export failed');
-        downloadBlob(response, `leads_${currentJobId}.${format}`);
+        await apiDownload(`/api/export/${currentJobId}/${format}`, `leads_${currentJobId}.${format}`);
         showToast(`Exported ${allResults.length} leads as ${format.toUpperCase()}`, 'success');
     } catch (error) {
         showToast(error.message, 'error');
@@ -873,9 +907,7 @@ async function exportDbJson() {
 async function downloadDbExport(format, industry) {
     try {
         const url = `/api/export-db/${format}?industry=${encodeURIComponent(industry)}`;
-        const response = await fetch(url);
-        if (!response.ok) throw new Error('Export failed');
-        downloadBlob(response, `leads_${industry || 'all'}.${format}`);
+        await apiDownload(url, `leads_${industry || 'all'}.${format}`);
         showToast(`Exported as ${format.toUpperCase()}`, 'success');
     } catch (error) {
         showToast(error.message, 'error');
@@ -911,7 +943,7 @@ function showConfirmDialog(message) {
         overlay.style.cssText = 'position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(0,0,0,0.5);display:flex;align-items:center;justify-content:center;z-index:10000;';
         
         const dialog = document.createElement('div');
-        dialog.style.cssText = 'background:var(--card-bg);padding:24px;border-radius:8px;max-width:400px;box-shadow:0 4px 20px rgba(0,0,0,0.3);';
+        dialog.style.cssText = 'background:var(--bg-card);padding:24px;border-radius:8px;max-width:400px;box-shadow:0 4px 20px rgba(0,0,0,0.3);';
         
         const msgEl = document.createElement('p');
         msgEl.textContent = message;
@@ -945,10 +977,11 @@ function showConfirmDialog(message) {
 
 async function checkDbConnection() {
     try {
-        const response = await fetch('/api/stats');
-        if (response.ok) {
-            const dot = document.getElementById('dbDot');
-            if (dot) dot.classList.add('connected');
+        const data = await apiFetchJson('/api/health', {}, 'Health check failed');
+        const dot = document.getElementById('dbDot');
+        if (dot) {
+            if (data.database.connected) dot.classList.add('connected');
+            else dot.classList.remove('connected');
         }
     } catch (e) {
         const dot = document.getElementById('dbDot');

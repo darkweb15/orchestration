@@ -8,8 +8,8 @@ from datetime import datetime
 class ScrapeRequest(BaseModel):
     """Request model for starting a scrape job."""
 
-    search_terms: list[str]  # one per line from UI
-    zip_codes: list[str]  # format: "zipcode city state country"
+    search_terms: list[str] = Field(..., min_length=1, max_length=20)
+    zip_codes: list[str] = Field(..., min_length=1, max_length=50)
     max_results_per_search: int = Field(default=20, ge=1, le=100)
     scraping_speed: str = Field(default="balanced")  # fast, balanced, quality
 
@@ -71,11 +71,11 @@ class ScrapeJob(BaseModel):
     """Represents a scraping job with progress tracking."""
 
     job_id: str = ""
-    status: str = "pending"  # pending, running, completed, failed
+    status: str = "pending"  # pending, running, completed, completed_with_errors, failed
     total: int = 0
     completed: int = 0
-    results: list[LeadResult] = []
-    errors: list[str] = []
+    results: list[LeadResult] = Field(default_factory=list)
+    errors: list[str] = Field(default_factory=list)
     duplicates_skipped: int = 0
     started_at: Optional[datetime] = None
-    leads_per_combination: list[float] = []  # track timing per combination
+    leads_per_combination: list[float] = Field(default_factory=list)  # track timing per combination

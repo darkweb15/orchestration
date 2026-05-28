@@ -2,74 +2,32 @@
 
 import os
 
-# Scraper settings
-MAX_CONCURRENT_BROWSERS = 3
-MAX_CONCURRENT_REQUESTS = 10
-REQUEST_TIMEOUT = 20  # seconds - increased for better results
-SCROLL_PAUSE_TIME = 2.0  # seconds between scrolls - increased for complete loading
-MAX_SCROLLS = 15  # max scrolls to load more results
+# ─── Scraper Settings ────────────────────────────────────────────────
+MAX_CONCURRENT_BROWSERS = int(os.environ.get("MAX_CONCURRENT_BROWSERS", 4))
+MAX_CONCURRENT_REQUESTS = int(os.environ.get("MAX_CONCURRENT_REQUESTS", 15))
+REQUEST_TIMEOUT = int(os.environ.get("REQUEST_TIMEOUT", 20))  # seconds
+SCROLL_PAUSE_TIME = 2.0   # seconds between scrolls
+MAX_SCROLLS = 15          # max scrolls to load more results
 
-# Page load wait times (seconds)
-GOOGLE_MAPS_INITIAL_WAIT = 4  # Wait after loading search results
-PLACE_PAGE_WAIT = 3  # Wait after loading place details
-SCROLL_WAIT = 1.5  # Wait after each scroll
-CONTENT_LOAD_WAIT = 2  # Wait for dynamic content to load
-
-# POS systems to detect
+# ─── POS Systems to Detect ──────────────────────────────────────────
 POS_SYSTEMS = [
-    "square",
-    "toast",
-    "clover",
-    "lightspeed",
-    "aloha",
-    "micros",
-    "revel",
-    "shopkeep",
-    "vend",
-    "shopify pos",
-    "touchbistro",
-    "upserve",
-    "cake pos",
-    "harbortouch",
-    "pos system",
-    "point of sale",
-    "ncr aloha",
-    "oracle micros",
-    "breadcrumb",
-    "lavu",
-    "talech",
-    "epos",
-    "epos now",
-    "sapaad",
-    "loyverse",
-    "erply",
-    "hike pos",
-    "bindo",
-    "kounta",
-    "imonggo",
-    "miva",
-    "helcim",
-    "paypal here",
-    "sumup",
-    "zettle",
-    "gofrugal",
-    "marg erp",
-    "busy software",
-    "tally",
+    "square", "toast", "clover", "lightspeed", "aloha", "micros",
+    "revel", "shopkeep", "vend", "shopify pos", "touchbistro", "upserve",
+    "cake pos", "harbortouch", "pos system", "point of sale", "ncr aloha",
+    "oracle micros", "breadcrumb", "lavu", "talech", "epos", "epos now",
+    "sapaad", "loyverse", "erply", "hike pos", "bindo", "kounta",
+    "imonggo", "miva", "helcim", "paypal here", "sumup", "zettle",
+    "gofrugal", "marg erp", "busy software", "tally",
 ]
-
-# Output directory
-OUTPUT_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), "output")
-os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 
 def get_wait_times(speed: str = "balanced") -> dict:
     """
     Get wait times based on scraping speed preference.
-    
+
     Args:
         speed: 'fast', 'balanced', or 'quality'
-    
+
     Returns:
         Dictionary with wait time values
     """
@@ -105,5 +63,4 @@ def get_wait_times(speed: str = "balanced") -> dict:
             "timeout": 25,
         },
     }
-    
     return wait_times.get(speed, wait_times["balanced"])

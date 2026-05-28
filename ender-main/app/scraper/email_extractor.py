@@ -1,21 +1,16 @@
 """Deep email extraction from websites, Facebook, Instagram — rebuilt with proven techniques."""
 
 import asyncio
+import html
 import re
-import ssl
 import logging
-from urllib.parse import urljoin, urlparse
+from urllib.parse import parse_qs, unquote, urljoin, urlparse
 
 import aiohttp
 from bs4 import BeautifulSoup
 
 from app.config import REQUEST_TIMEOUT, MAX_CONCURRENT_REQUESTS
-
-
-def _create_ssl_context() -> ssl.SSLContext:
-    """Create an SSL context that verifies certificates but tolerates common issues."""
-    ctx = ssl.create_default_context()
-    return ctx
+from app.utils import create_ssl_context
 
 logger = logging.getLogger(__name__)
 
@@ -53,6 +48,42 @@ CONTACT_PAGE_KEYWORDS = [
 ]
 
 
+def _decode_escape_sequences(text: str) -> str:
+    """Decode common escaped forms used in JSON blobs and tracker links."""
+    if not text:
+        return ""
+
+    def replace_unicode(match: re.Match) -> str:
+        codepoint = match.group(1) or match.group(2)
+        try:
+            return chr(int(codepoint, 16))
+        except (TypeError, ValueError):
+            return match.group(0)
+
+    text = re.sub(r'\\u([0-9a-fA-F]{4})|\\x([0-9a-fA-F]{2})', replace_unicode, text)
+    text = html.unescape(text)
+
+    try:
+        text = unquote(text)
+    except Exception:
+        pass
+
+    return text
+
+
+def _normalize_email_text(raw_text: str) -> str:
+    """Normalize obfuscated and escaped email text before regex extraction."""
+    if not raw_text:
+        return ""
+
+    normalized = _decode_escape_sequences(raw_text).lower()
+    normalized = normalized.replace('[at]', '@').replace('(at)', '@')
+    normalized = normalized.replace('[dot]', '.').replace('(dot)', '.')
+    normalized = normalized.replace(' at ', '@').replace(' dot ', '.')
+    normalized = re.sub(r'[\u200b-\u200d\u2060\ufeff]', '', normalized)
+    return normalized
+
+
 def find_emails(html: str) -> list[str]:
     """
     Advanced email extraction with obfuscation handling.
@@ -62,10 +93,7 @@ def find_emails(html: str) -> list[str]:
         return []
 
     # Normalize obfuscated patterns
-    html_lower = html.lower()
-    html_lower = html_lower.replace('[at]', '@').replace('(at)', '@')
-    html_lower = html_lower.replace('[dot]', '.').replace('(dot)', '.')
-    html_lower = html_lower.replace(' at ', '@').replace(' dot ', '.')
+    html_lower = _normalize_email_text(html)
 
     # Extract emails using regex
     emails = EMAIL_REGEX.findall(html_lower)
@@ -80,9 +108,9 @@ def find_emails(html: str) -> list[str]:
             pass
 
     # Also check mailto links in original HTML
-    mailto_matches = re.findall(r'mailto:([^"\'?\s<>]+)', html, re.IGNORECASE)
+    mailto_matches = re.findall(r'mailto:([^"\'?\s<>]+)', _decode_escape_sequences(html), re.IGNORECASE)
     for m in mailto_matches:
-        email = m.split('?')[0].strip()
+        email = unquote(m.split('?')[0].strip()).lower()
         if EMAIL_REGEX.match(email.lower()):
             emails.append(email.lower())
 
@@ -116,32 +144,192 @@ def find_emails(html: str) -> list[str]:
     return sorted(set(valid_emails))
 
 
-def _extract_social_links(html: str) -> dict[str, str]:
-    """Extract social media links using advanced regex patterns."""
+FACEBOOK_RESERVED_SEGMENTS = {
+    "tr", "plugins", "dialog", "share", "share.php", "sharer", "sharer.php",
+    "login", "recover", "privacy", "policy", "policies", "terms", "legal",
+    "help", "business", "ads", "watch", "reel", "reels", "stories",
+    "events", "hashtag", "photo", "photos", "notes", "messages",
+    "notifications", "marketplace", "gaming", "fundraisers", "pg",
+}
+
+INSTAGRAM_RESERVED_SEGMENTS = {
+    "accounts", "about", "developer", "directory", "explore", "p", "reel",
+    "reels", "stories", "tv", "direct", "challenge",
+}
+
+TWITTER_RESERVED_SEGMENTS = {
+    "home", "share", "intent", "search", "hashtag", "i", "settings",
+    "privacy", "tos", "explore",
+}
+
+LINKEDIN_RESERVED_SEGMENTS = {
+    "feed", "jobs", "learning", "help", "legal", "authwall", "checkpoint",
+}
+
+
+def _normalize_social_url(raw_url: str, network: str) -> str:
+    """Normalize a social URL and filter out tracker/share/system URLs."""
+    if not raw_url:
+        return ""
+
+    parsed = urlparse(html.unescape(raw_url.strip()))
+    if not parsed.scheme or not parsed.netloc:
+        return ""
+
+    netloc = parsed.netloc.lower()
+    path = parsed.path.strip("/")
+    query = parse_qs(parsed.query)
+
+    if network == "facebook":
+        if "facebook.com" not in netloc and "fb.com" not in netloc:
+            return ""
+
+        if parsed.path == "/l.php" and query.get("u"):
+            return _normalize_social_url(unquote(query["u"][0]), network)
+
+        if not path:
+            return ""
+        if path.lower().endswith("fbml"):
+            return ""
+        if path.lower() == "profile.php":
+            profile_id = query.get("id", [""])[0].strip()
+            return (
+                f"https://www.facebook.com/profile.php?id={profile_id}"
+                if profile_id
+                else ""
+            )
+
+        first = path.split("/", 1)[0].lower()
+        if first in FACEBOOK_RESERVED_SEGMENTS or first == "2008":
+            return ""
+        return f"https://www.facebook.com/{path}"
+
+    if network == "instagram":
+        if "instagram.com" not in netloc:
+            return ""
+        if not path:
+            return ""
+        first = path.split("/", 1)[0].lower()
+        if first in INSTAGRAM_RESERVED_SEGMENTS:
+            return ""
+        return f"https://www.instagram.com/{path}"
+
+    if network == "twitter":
+        if "twitter.com" not in netloc and netloc != "x.com" and not netloc.endswith(".x.com"):
+            return ""
+        if not path:
+            return ""
+        first = path.split("/", 1)[0].lower()
+        if first in TWITTER_RESERVED_SEGMENTS:
+            return ""
+        return f"https://twitter.com/{path}"
+
+    if network == "linkedin":
+        if "linkedin.com" not in netloc:
+            return ""
+        if not path:
+            return ""
+        first = path.split("/", 1)[0].lower()
+        if first in LINKEDIN_RESERVED_SEGMENTS:
+            return ""
+        return f"https://www.linkedin.com/{path}"
+
+    return ""
+
+
+def _extract_social_links(html: str, base_url: str = "") -> dict[str, str]:
+    """Extract social media links while skipping trackers and platform boilerplate."""
     socials = {"facebook": "", "instagram": "", "twitter": "", "linkedin": ""}
     if not html:
         return socials
 
+    soup = BeautifulSoup(html, "lxml")
+
+    # Prefer real links from href attributes first.
+    for tag in soup.find_all("a", href=True):
+        href = urljoin(base_url, tag["href"])
+        for network in socials:
+            if socials[network]:
+                continue
+            normalized = _normalize_social_url(href, network)
+            if normalized:
+                socials[network] = normalized
+
+    # Fallback: scan the HTML for absolute URLs embedded in scripts/JSON blobs.
     patterns = {
-        "facebook": r'https?://(?:[a-z]{2,3}\.)?facebook\.com/(?:pages/|people/|groups/|profile\.php\?id=)?([^\s"\'<>?&/]+)',
-        "instagram": r'https?://(?:www\.)?instagram\.com/([^\s"\'<>?&/]+)',
-        "twitter": r'https?://(?:www\.)?(?:twitter|x)\.com/([^\s"\'<>?&/]+)',
-        "linkedin": r'https?://(?:[a-z]{2,3}\.)?linkedin\.com/(?:company|in|school)/([^\s"\'<>?&/]+)',
+        "facebook": r'https?://[^\s"\'<>]+facebook\.com/[^\s"\'<>]+',
+        "instagram": r'https?://[^\s"\'<>]+instagram\.com/[^\s"\'<>]+',
+        "twitter": r'https?://[^\s"\'<>]+(?:twitter\.com|x\.com)/[^\s"\'<>]+',
+        "linkedin": r'https?://[^\s"\'<>]+linkedin\.com/[^\s"\'<>]+',
     }
-    for key, pattern in patterns.items():
-        match = re.search(pattern, html, re.IGNORECASE)
-        if match:
-            username = match.group(1)
-            if key == "facebook":
-                socials[key] = f"https://www.facebook.com/{username}"
-            elif key == "instagram":
-                socials[key] = f"https://www.instagram.com/{username}"
-            elif key == "twitter":
-                socials[key] = f"https://twitter.com/{username}"
-            elif key == "linkedin":
-                socials[key] = f"https://www.linkedin.com/company/{username}"
+    for network, pattern in patterns.items():
+        if socials[network]:
+            continue
+        for match in re.finditer(pattern, html, re.IGNORECASE):
+            normalized = _normalize_social_url(match.group(0), network)
+            if normalized:
+                socials[network] = normalized
+                break
 
     return socials
+
+
+def build_email_result(
+    website_emails,
+    facebook_emails,
+    instagram_emails,
+    google_maps_email: str = "",
+    store_name: str = "",
+    website_url: str = "",
+    social_links: dict[str, str] | None = None,
+) -> dict:
+    """Build the canonical email result payload from all discovered sources."""
+    website_emails = find_emails(" ".join(website_emails) if isinstance(website_emails, list) else str(website_emails or ""))
+    fb_emails = find_emails(" ".join(facebook_emails) if isinstance(facebook_emails, list) else str(facebook_emails or ""))
+    ig_emails = find_emails(" ".join(instagram_emails) if isinstance(instagram_emails, list) else str(instagram_emails or ""))
+
+    all_emails = set()
+    if google_maps_email:
+        all_emails.update(find_emails(google_maps_email))
+    all_emails.update(website_emails)
+    all_emails.update(fb_emails)
+    all_emails.update(ig_emails)
+    all_emails_list = sorted(all_emails)
+
+    final_email = ""
+    source = ""
+
+    if fb_emails:
+        final_email = fb_emails[0]
+        source = "Facebook"
+    elif website_emails and store_name:
+        matched = _match_store_name_email(website_emails, store_name, website_url)
+        if matched:
+            final_email = matched
+            source = "Website (store match)"
+        else:
+            final_email = get_domain_matched_email(website_emails, website_url)
+            source = "Website"
+    elif website_emails:
+        final_email = get_domain_matched_email(website_emails, website_url)
+        source = "Website"
+    elif google_maps_email:
+        final_email = google_maps_email
+        source = "Google Maps"
+    elif ig_emails:
+        final_email = ig_emails[0]
+        source = "Instagram"
+
+    return {
+        "website_email": website_emails[0] if website_emails else "",
+        "all_website_emails": ", ".join(website_emails),
+        "facebook_email": ", ".join(fb_emails) if fb_emails else "",
+        "instagram_email": ", ".join(ig_emails) if ig_emails else "",
+        "final_email": final_email,
+        "comparing_emails": ", ".join(all_emails_list),
+        "email_source": source,
+        "social_links": social_links or {},
+    }
 
 
 async def _fetch_page(session: aiohttp.ClientSession, url: str) -> str:
@@ -158,7 +346,7 @@ async def _fetch_page(session: aiohttp.ClientSession, url: str) -> str:
         }
         async with session.get(
             url, headers=headers, timeout=aiohttp.ClientTimeout(total=REQUEST_TIMEOUT),
-            ssl=_create_ssl_context(), allow_redirects=True
+            ssl=create_ssl_context(), allow_redirects=True
         ) as response:
             if response.status == 200:
                 return await response.text(errors="replace")
@@ -176,6 +364,8 @@ def _find_contact_pages(html: str, base_url: str) -> list[str]:
     soup = BeautifulSoup(html, "lxml")
     for link in soup.find_all("a", href=True):
         href = link["href"].strip()
+        if href.startswith(("mailto:", "tel:", "javascript:", "#")):
+            continue
         text = link.get_text().strip().lower()
         href_lower = href.lower()
 
@@ -274,7 +464,11 @@ async def _playwright_scrape_website(url: str) -> tuple[list[str], dict[str, str
             }""")
 
             emails = data.get("emails", [])
-            social_links = data.get("social", social_links)
+            raw_social_links = data.get("social", social_links)
+            social_links = {
+                network: _normalize_social_url(raw_social_links.get(network, ""), network)
+                for network in social_links
+            }
 
             # Visit contact pages for more emails
             for contact_url in data.get("contactPages", []):
@@ -341,32 +535,38 @@ async def extract_website_emails(website_url: str) -> dict:
     social_links = {}
 
     # Phase 1: Fast aiohttp extraction
-    connector = aiohttp.TCPConnector(limit=MAX_CONCURRENT_REQUESTS, ssl=_create_ssl_context())
+    connector = aiohttp.TCPConnector(limit=MAX_CONCURRENT_REQUESTS, ssl=create_ssl_context())
     async with aiohttp.ClientSession(connector=connector) as session:
         homepage_html = await _fetch_page(session, website_url)
         if homepage_html:
             all_emails.extend(find_emails(homepage_html))
-            social_links = _extract_social_links(homepage_html)
+            social_links = _extract_social_links(homepage_html, website_url)
 
             contact_pages = _find_contact_pages(homepage_html, website_url)
             if contact_pages:
                 tasks = [_fetch_page(session, url) for url in contact_pages]
                 pages = await asyncio.gather(*tasks, return_exceptions=True)
-                for page_html in pages:
+                for contact_url, page_html in zip(contact_pages, pages):
                     if isinstance(page_html, str) and page_html:
                         all_emails.extend(find_emails(page_html))
-                        page_social = _extract_social_links(page_html)
+                        page_social = _extract_social_links(page_html, contact_url)
                         for key, val in page_social.items():
                             if val and not social_links.get(key):
                                 social_links[key] = val
 
     filtered = find_emails(" ".join(all_emails)) if all_emails else []
 
-    # Phase 2: Playwright fallback for JS-rendered sites
-    if not filtered:
-        logger.info(f"No emails via aiohttp for {website_url}, trying Playwright...")
+    # Phase 2: Playwright fallback for JS-rendered sites and client-side social links.
+    if not filtered or not any(social_links.values()):
+        logger.info(
+            "Website fallback via Playwright for %s (emails=%s, socials=%s)",
+            website_url,
+            "found" if filtered else "missing",
+            "found" if any(social_links.values()) else "missing",
+        )
         pw_emails, pw_social = await _playwright_scrape_website(website_url)
-        filtered.extend(pw_emails)
+        if not filtered:
+            filtered.extend(pw_emails)
         for key, val in pw_social.items():
             if val and not social_links.get(key):
                 social_links[key] = val
@@ -388,7 +588,11 @@ async def extract_facebook_email(facebook_url: str) -> list[str]:
         return []
 
     emails = []
-    base = facebook_url.rstrip("/")
+    normalized_url = _normalize_social_url(facebook_url, "facebook")
+    if not normalized_url:
+        return []
+
+    base = normalized_url.rstrip("/")
 
     # Normalize URL to www.facebook.com (desktop version shows more data)
     parsed_fb = urlparse(base)
@@ -397,12 +601,23 @@ async def extract_facebook_email(facebook_url: str) -> list[str]:
     else:
         desktop_base = base
 
-    # Main page first (contains email in page data), then /about variants
-    fb_urls = [
-        desktop_base,
-        desktop_base + "/about",
-        desktop_base + "/about_contact_and_basic_info",
-    ]
+    mobile_base = desktop_base
+    try:
+        mobile_base = urlparse(desktop_base)._replace(netloc="m.facebook.com").geturl()
+    except Exception:
+        pass
+
+    # Try desktop + mobile public variants because Facebook exposes different data across them.
+    fb_urls = []
+    for base_url in (desktop_base, mobile_base):
+        fb_urls.extend(
+            [
+                base_url,
+                base_url + "/about",
+                base_url + "/about_contact_and_basic_info",
+            ]
+        )
+    fb_urls = list(dict.fromkeys(fb_urls))
 
     try:
         from playwright.async_api import async_playwright
@@ -429,51 +644,58 @@ async def extract_facebook_email(facebook_url: str) -> list[str]:
                     await page.goto(url, wait_until="domcontentloaded", timeout=18000)  # Increased
                     await asyncio.sleep(4)  # Increased wait for Facebook to load
 
-                    # Close the login popup that Facebook shows to non-logged-in users
-                    try:
-                        close_btn = await page.query_selector('[aria-label="Close"]')
-                        if close_btn:
-                            await close_btn.click()
-                            await asyncio.sleep(1)
-                            logger.debug(f"Closed Facebook login popup on {url}")
-                    except Exception:
-                        pass
+                    # Close the login / cookie popups Facebook shows to non-logged-in users.
+                    for selector in (
+                        '[aria-label="Close"]',
+                        '[aria-label="Close dialog"]',
+                        'text=/accept/i',
+                        'text=/allow essential/i',
+                    ):
+                        try:
+                            btn = page.locator(selector).first
+                            if await btn.count():
+                                await btn.click(timeout=1500)
+                                await asyncio.sleep(0.8)
+                        except Exception:
+                            pass
 
-                    # Scroll down to load more content
+                    # Expand inline details so contact info becomes visible when it is collapsed.
+                    for selector in (
+                        'text=/see more/i',
+                        'text=/more/i',
+                        'text=/contact info/i',
+                        'text=/about/i',
+                    ):
+                        try:
+                            btn = page.locator(selector).first
+                            if await btn.count():
+                                await btn.click(timeout=1500)
+                                await asyncio.sleep(0.8)
+                        except Exception:
+                            pass
+
+                    # Scroll a bit to trigger lazy sections.
                     await page.evaluate("window.scrollTo(0, document.body.scrollHeight / 3)")
-                    await asyncio.sleep(1.5)  # Increased wait
+                    await asyncio.sleep(1)
+                    await page.evaluate("window.scrollTo(0, document.body.scrollHeight * 0.7)")
+                    await asyncio.sleep(1.5)
 
-                    # Extract emails from full rendered page via JS
-                    page_data = await page.evaluate("""() => {
-                        // Get the full page HTML (includes data in scripts, meta tags, etc.)
-                        const fullHtml = document.documentElement.innerHTML.toLowerCase()
-                            .replace(/\\[at\\]/g, '@').replace(/\\(at\\)/g, '@')
-                            .replace(/\\[dot\\]/g, '.').replace(/\\(dot\\)/g, '.');
-
-                        const emailRegex = /[a-zA-Z0-9._%+\\-]+@[a-zA-Z0-9.\\-]+\\.[a-zA-Z]{2,}/g;
-                        const emails = [...new Set(fullHtml.match(emailRegex) || [])];
-
-                        // Check mailto links
-                        document.querySelectorAll('a[href*="mailto:"]').forEach(a => {
-                            const email = a.href.replace('mailto:', '').split('?')[0].trim().toLowerCase();
-                            if (email && email.includes('@') && !emails.includes(email)) emails.push(email);
-                        });
-
-                        // Check text nodes for email patterns
-                        const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
-                        while (walker.nextNode()) {
-                            const text = walker.currentNode.textContent.toLowerCase()
-                                .replace(/\\[at\\]/g, '@').replace(/\\(at\\)/g, '@')
-                                .replace(/\\[dot\\]/g, '.').replace(/\\(dot\\)/g, '.');
-                            const found = text.match(emailRegex);
-                            if (found) found.forEach(e => { if (!emails.includes(e)) emails.push(e); });
-                        }
-
-                        return emails;
+                    # Extract rendered HTML, visible text, hrefs, and meta content so Python can
+                    # apply stronger normalization/decoding for JSON-escaped emails.
+                    page_payload = await page.evaluate("""() => {
+                        const html = document.documentElement ? document.documentElement.outerHTML : '';
+                        const text = document.body ? document.body.innerText : '';
+                        const hrefs = Array.from(document.querySelectorAll('a[href]'))
+                            .map(a => a.getAttribute('href') || a.href || '')
+                            .join('\\n');
+                        const metas = Array.from(document.querySelectorAll('meta[content]'))
+                            .map(meta => meta.getAttribute('content') || '')
+                            .join('\\n');
+                        return [html, text, hrefs, metas].join('\\n');
                     }""")
 
-                    if page_data:
-                        found = find_emails(" ".join(page_data))
+                    if page_payload:
+                        found = find_emails(page_payload)
                         emails.extend(found)
                         if found:
                             logger.info(f"Found Facebook emails from {url}: {found}")
@@ -500,6 +722,9 @@ async def extract_instagram_email(instagram_url: str) -> list[str]:
         return []
 
     emails = []
+    instagram_url = _normalize_social_url(instagram_url, "instagram")
+    if not instagram_url:
+        return []
 
     try:
         from playwright.async_api import async_playwright
@@ -543,7 +768,7 @@ async def extract_instagram_email(instagram_url: str) -> list[str]:
     except Exception as e:
         logger.debug(f"Playwright Instagram extraction failed for {instagram_url}: {e}")
         # Fallback to aiohttp
-        connector = aiohttp.TCPConnector(limit=5, ssl=_create_ssl_context())
+        connector = aiohttp.TCPConnector(limit=5, ssl=create_ssl_context())
         async with aiohttp.ClientSession(connector=connector) as session:
             html = await _fetch_page(session, instagram_url)
             if html:
@@ -613,56 +838,25 @@ async def extract_all_emails(
     website_emails = website_result.get("emails", [])
     social_links = website_result.get("social_links", {})
 
-    # Collect all unique emails
-    all_emails = set()
-    if google_maps_email:
-        all_emails.add(google_maps_email.lower())
-    for e in website_emails:
-        all_emails.add(e.lower())
-    for e in fb_emails:
-        all_emails.add(e.lower())
-    for e in ig_emails:
-        all_emails.add(e.lower())
+    # Second pass: if the website reveals social links late, scrape those too before final ranking.
+    if social_links.get("facebook") and not fb_emails:
+        try:
+            fb_emails = await extract_facebook_email(social_links["facebook"])
+        except Exception as e:
+            logger.debug(f"Late Facebook extraction failed for {social_links['facebook']}: {e}")
 
-    all_emails_list = sorted(all_emails)
+    if social_links.get("instagram") and not ig_emails:
+        try:
+            ig_emails = await extract_instagram_email(social_links["instagram"])
+        except Exception as e:
+            logger.debug(f"Late Instagram extraction failed for {social_links['instagram']}: {e}")
 
-    # Smart email priority:
-    # 1. Facebook email (first priority)
-    # 2. Store name first 3 letters / domain match against all website emails
-    # 3. Domain-matched website email
-    # 4. Google Maps email
-    # 5. Instagram email
-    final_email = ""
-    source = ""
-
-    if fb_emails:
-        final_email = fb_emails[0]
-        source = "Facebook"
-    elif website_emails and store_name:
-        matched = _match_store_name_email(website_emails, store_name, website_url)
-        if matched:
-            final_email = matched
-            source = "Website (store match)"
-        else:
-            final_email = get_domain_matched_email(website_emails, website_url)
-            source = "Website"
-    elif website_emails:
-        final_email = get_domain_matched_email(website_emails, website_url)
-        source = "Website"
-    elif google_maps_email:
-        final_email = google_maps_email
-        source = "Google Maps"
-    elif ig_emails:
-        final_email = ig_emails[0]
-        source = "Instagram"
-
-    return {
-        "website_email": website_emails[0] if website_emails else "",
-        "all_website_emails": ", ".join(website_emails),
-        "facebook_email": ", ".join(fb_emails) if fb_emails else "",
-        "instagram_email": ", ".join(ig_emails) if ig_emails else "",
-        "final_email": final_email,
-        "comparing_emails": ", ".join(all_emails_list),
-        "email_source": source,
-        "social_links": social_links,
-    }
+    return build_email_result(
+        website_emails=website_emails,
+        facebook_emails=fb_emails,
+        instagram_emails=ig_emails,
+        google_maps_email=google_maps_email,
+        store_name=store_name,
+        website_url=website_url,
+        social_links=social_links,
+    )
